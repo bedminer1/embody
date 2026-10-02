@@ -1,0 +1,17 @@
+[Unit]
+Description=Embody RVR and camera bridge
+After=network.target
+
+[Service]
+Type=simple
+User=alex
+Group=alex
+SupplementaryGroups=video dialout
+WorkingDirectory=/home/alex/embody
+EnvironmentFile=-/home/alex/embody/agent.env
+ExecStart=/home/alex/embody/.venv/bin/python /home/alex/embody/agent.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
