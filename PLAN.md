@@ -4,11 +4,11 @@
 
 - Pi 5 camera service, official Sphero SDK, GPIO UART, sensor/motor bridge, and boot service are installed.
 - Rust desktop app builds, opens a video window, receives live 30 fps MJPEG and telemetry, and sends terminal WASD controls through an SSH tunnel. The terminal dashboard updates in place. `--json` provides bounded commands, telemetry, and JPEG snapshots for programs.
-- SSH key login works as `ssh pi5` on the desktop. The Pi currently has LAN address `192.168.1.103`.
+- SSH key login works as `ssh pi5` over Tailscale (`100.96.244.79`). Pi Wi-Fi is configured for `NUS_STU`. Root `AGENTS.md` provides the Mac setup handoff.
 
-## Waiting for physical RVR connection
+## Physical RVR validation
 
-The RVR is not wired or powered yet, so its SDK wake, sensor readings, motor direction, and fail-stop behavior cannot be confirmed. Follow the wiring and enablement steps in [README.md](README.md). Verify the RVR firmware is current in the Sphero Edu app if SDK wake fails. Start with a short, low-speed test while the tracks are clear of the ground, then check stop on `Space`, desktop exit, SSH disconnect, and Pi service restart. Adjust speed and steering direction only after these observations.
+The RVR UART connection, SDK wake, battery query, live sensor readings, LED control, and a short forward motor pulse have been confirmed. A/D pivots drift forward on the current surface, so the forward track duty during pivots is now independently adjustable. Verify the new balance on a clear floor, then check stop on `Space`, desktop exit, SSH disconnect, and Pi service restart.
 
 ## LLM and perception
 
@@ -16,4 +16,6 @@ The Rust desktop program now provides human teleoperation plus a newline-delimit
 
 ## Notes
 
-Sphero's Python SDK declares dependencies pinned around 2020. On Ubuntu 24.04/Python 3.12, its code was installed without those old pins, with current `aiohttp`, `pyserial-asyncio`, and system OpenCV. Import and camera streaming work; RVR runtime compatibility awaits the wired hardware test. The service is deliberately configured camera-only until then.
+Sphero's Python SDK declares dependencies pinned around 2020. On Ubuntu 24.04/Python 3.12, its code was installed without those old pins, with current `aiohttp`, `pyserial-asyncio`, and system OpenCV. Camera streaming and bidirectional RVR UART communication have been confirmed. On 2026-10-07, a no-drive probe returned 84% battery; the restarted service reported a ready motor link and live IMU/encoder data.
+
+Follow-ups: retry the rover connection after a failed startup check; bound SDK shutdown so service restarts cannot hang; restore reliable NTP synchronization on the Pi. The Pi clock was manually corrected to restore Tailscale, but NTP still reported unsynchronized. Verify the Mac build and GUI on the actual Mac; Linux checks do not substitute for that.

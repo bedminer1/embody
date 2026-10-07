@@ -1,4 +1,3 @@
-use crate::controls::track_commands;
 use crate::protocol::Telemetry;
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::style::{Color, Print, SetForegroundColor};
@@ -18,6 +17,7 @@ struct View {
     keys: String,
     tracks: [i16; 2],
     fixed_speed: Option<u8>,
+    pivot_forward_percent: Option<u8>,
     status: String,
     size: (u16, u16),
 }
@@ -40,7 +40,8 @@ impl Dashboard {
         let size = terminal::size()?;
         let (width, height) = size;
         let fixed_speed = telemetry.and_then(|data| data.speed_limit);
-        let tracks = track_commands(keys, i16::from(fixed_speed.unwrap_or(0)));
+        let pivot_forward_percent = telemetry.and_then(|data| data.pivot_forward_percent);
+        let tracks = telemetry.map_or([0, 0], |data| data.tracks);
         let motor_status = match telemetry {
             Some(data) if data.error.is_some() => "Motor error · check Pi service",
             Some(data) if data.rvr_connected => "Motor link ready",
@@ -51,6 +52,7 @@ impl Dashboard {
             keys: keys.to_string(),
             tracks,
             fixed_speed,
+            pivot_forward_percent,
             status: motor_status.to_string(),
             size,
         };
@@ -65,6 +67,8 @@ impl Dashboard {
         }
 
         let fixed_speed = fixed_speed.map_or("--".to_string(), |speed| speed.to_string());
+        let pivot_forward_percent =
+            pivot_forward_percent.map_or("--".to_string(), |percent| percent.to_string());
 
         self.border(0, '╭', '╮')?;
         self.line(
@@ -93,7 +97,11 @@ impl Dashboard {
             ),
             Color::White,
         )?;
-        self.line(6, "", Color::White)?;
+        self.line(
+            6,
+            &format!("      A/D pivot balance: forward track {pivot_forward_percent}%"),
+            Color::DarkGrey,
+        )?;
         self.line(7, &track_row("LEFT ", tracks[0]), Color::Green)?;
         self.line(8, &track_row("RIGHT", tracks[1]), Color::Green)?;
         self.line(9, "", Color::White)?;

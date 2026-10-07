@@ -6,23 +6,45 @@ The Raspberry Pi 5 runs a Python bridge for the RVR and USB camera. The desktop 
 
 - Pi: Ubuntu 24.04, USB camera `/dev/video0`, official Sphero Python SDK in `/home/alex/embody/.venv`, service `embody-pi.service` enabled and running.
 - Pi 5 GPIO UART enabled as `/dev/ttyAMA0`; `alex` is in `dialout` and `video`.
-- Desktop: `ssh pi5` uses the existing SSH key and the Pi's current LAN address. The address is set to `192.168.1.103` in `~/.ssh/config`; update it if DHCP changes the address.
-- The RVR is **not connected yet**. The Pi service intentionally runs with `EMBODY_RVR_SERIAL=` (camera-only mode). No motor or RVR sensor test has been performed.
+- Desktop: `ssh pi5` uses key authentication to the Pi's Tailscale address, `100.96.244.79`. Both desktop and Pi must be online in the same tailnet; they can use different Wi-Fi networks. The Pi Wi-Fi is configured for `NUS_STU`.
+- The RVR is connected over the Pi 5 GPIO UART. The Pi service runs with `EMBODY_RVR_SERIAL=/dev/ttyAMA0`; the official Sphero LED example, a bounded forward pulse, battery query, and live sensor telemetry have all worked.
 
 ## Run the desktop app
 
-From a terminal on this desktop:
+From a terminal in your checkout (Linux or macOS):
 
 ```sh
-cd /home/alex/Desktop/robotics/embody/desktop
+cd desktop
 cargo run --release
 ```
 
-The program opens the camera window and a fixed terminal dashboard with active WASD keys, each track command, and the fixed speed. The dashboard updates in place. Keep the **terminal** focused to control the rover while watching the video window. `W` and `S` drive forward and reverse. `A` and `D` pivot left and right while stationary, or steer while moving. `Space` stops, and `X` or `Esc` quits. The fixed motor setting starts at 70/255 and can be changed with the Pi agent's `--speed` option. The Pi stops after 500 ms without a control packet, and the RVR firmware receives a 750 ms motor command timeout when connected.
+The program opens the camera window and a fixed terminal dashboard with active WASD keys, the commanded track speeds, and the fixed speed. The dashboard updates in place. Keep the **terminal** focused to control the rover while watching the video window. `W` and `S` drive forward and reverse. `A` and `D` pivot left and right while stationary, or steer while moving. `Space` stops, and `X` or `Esc` quits. The fixed motor setting starts at 70/255 and can be changed with the Pi agent's `--speed` option. During an A/D pivot, the forward track starts at 60% of that setting (42/255), while the reverse track uses 70/255. The Pi stops after 500 ms without a control packet, and the RVR firmware receives a 750 ms motor command timeout when connected.
 
 The terminal uses key press/repeat events and release events where available. If the terminal does not report releases, a key expires 350 ms after its last press. Hold a key to use keyboard repeat. `Space` always clears the active keys.
 
 The desktop connects through `ssh -N -L 18765:127.0.0.1:8765 pi5` automatically. The Pi service only listens on its loopback interface; there is no unauthenticated network control port.
+
+For a new Mac, follow the setup and SSH instructions in [AGENTS.md](AGENTS.md).
+The Pi already authorizes a Mac public key; use the matching key on that Mac.
+Quit the other desktop client before connecting from a different computer.
+
+## Start the Pi service
+
+The installed `embody-pi.service` is enabled at boot. Power the RVR before the
+agent starts. To start, inspect, or restart it:
+
+```sh
+ssh pi5
+sudo systemctl start embody-pi.service
+systemctl status embody-pi.service --no-pager -l
+sudo journalctl -u embody-pi.service -n 50 --no-pager
+# After restoring a failed rover connection:
+sudo systemctl restart embody-pi.service
+```
+
+Restart the desktop app after restarting the Pi service. Video alone does not
+prove a motor connection: check `Motor link ready` and battery/sensor telemetry.
+The agent currently needs a restart after a failed startup rover check.
 
 ## Connect the RVR
 
@@ -42,7 +64,9 @@ systemctl status embody-pi.service
 
 If the RVR is not connected, restore camera-only mode with `printf 'EMBODY_RVR_SERIAL=\n' > ~/embody/agent.env` followed by `sudo systemctl restart embody-pi.service`. Check service logs with `sudo journalctl -u embody-pi.service -n 50 --no-pager`.
 
-Sphero's [Pi setup guide](https://sdk.sphero.com/raspberry-pi-setup/python-sdk-setup-advanced) has the rover connector diagram. Raspberry Pi's [UART documentation](https://www.raspberrypi.com/documentation/computers/configuration.html#uarts-and-device-tree) explains the Pi 5 overlay and pins. The SDK's default `/dev/ttyS0` is wrong for this Pi 5; this bridge explicitly uses `/dev/ttyAMA0`.
+To tune A/D turns, set `EMBODY_PIVOT_FORWARD_PERCENT` in `~/embody/agent.env` to a value from 0 to 100 and restart the service. Lower values reduce the forward track's duty during pivots; `100` restores equal forward and reverse duties. This setting does not change W/S or W+A/W+D. The dashboard shows the actual commanded values for each track.
+
+Sphero's [Pi setup guide](https://sdk.sphero.com/raspberry-pi-setup/python-sdk-setup-advanced) has the rover connector diagram. Raspberry Pi's [UART documentation](https://www.raspberrypi.com/documentation/computers/configuration.html#uarts-and-device-tree) explains the Pi 5 overlay and pins. The SDK's default `/dev/ttyS0` is wrong for this Pi 5; this bridge explicitly uses `/dev/ttyAMA0`. Disconnect the Sphero Edu app before using the desktop controls to avoid conflicting commands.
 
 ## Code and protocol
 

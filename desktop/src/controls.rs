@@ -51,18 +51,3 @@ pub fn normalize_keys(raw: &str) -> String {
     let raw = raw.to_ascii_lowercase();
     "wasd".chars().filter(|key| raw.contains(*key)).collect()
 }
-
-pub fn track_commands(keys: &str, speed: i16) -> [i16; 2] {
-    let drive = i16::from(keys.contains('w')) - i16::from(keys.contains('s'));
-    let turn = i16::from(keys.contains('d')) - i16::from(keys.contains('a'));
-    if drive == 0 {
-        return [turn * speed, -turn * speed];
-    }
-    let mut tracks = [drive * speed; 2];
-    if (drive > 0 && turn < 0) || (drive < 0 && turn > 0) {
-        tracks[0] = (f32::from(tracks[0]) * 0.45) as i16;
-    } else if (drive > 0 && turn > 0) || (drive < 0 && turn < 0) {
-        tracks[1] = (f32::from(tracks[1]) * 0.45) as i16;
-    }
-    tracks
-}

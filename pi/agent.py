@@ -94,9 +94,11 @@ class Camera:
 
 
 class Rover:
-    def __init__(self, port, speed):
+    def __init__(self, port, speed, pivot_forward_percent):
         self.port, self.speed = port, speed
+        self.pivot_forward_percent = pivot_forward_percent
         self.rvr = None
+        self.connected = False
         self.sensors = {}
         self.last_keys = ""
         self.last_command = 0.0
@@ -105,14 +107,29 @@ class Rover:
         self.battery = None
         self.error = None
 
+    def prepare(self, loop):
+        if not self.port:
+            return
+        from sphero_sdk import SpheroRvrAsync, SerialAsyncDal
+        # The official SDK runs its firmware check in the constructor, so
+        # construction must happen before this event loop starts running.
+        self.rvr = SpheroRvrAsync(dal=SerialAsyncDal(loop, port_id=self.port))
+
     async def connect(self):
         if not self.port:
             LOG.warning("Camera-only mode: RVR serial port disabled")
             return
-        from sphero_sdk import SpheroRvrAsync, SerialAsyncDal, RvrStreamingServices
-        self.rvr = SpheroRvrAsync(dal=SerialAsyncDal(asyncio.get_running_loop(), port_id=self.port))
+        from sphero_sdk import RvrStreamingServices
         await self.rvr.wake()
         await asyncio.sleep(2)
+        battery = await asyncio.wait_for(
+            self.rvr.get_battery_percentage(timeout=3), timeout=4
+        )
+        if not isinstance(battery, dict) or "percentage" not in battery:
+            raise RuntimeError(f"RVR did not answer battery query: {battery!r}")
+        self.battery = battery
+        self.connected = True
+        LOG.info("RVR battery response: %s", battery)
         await self.rvr.set_custom_control_system_timeout(command_timeout=750)
         async def handler(name, data):
             self.sensors[name] = data
@@ -137,7 +154,12 @@ class Rover:
         forward = ("w" in keys) - ("s" in keys)
         turn = ("d" in keys) - ("a" in keys)
         if not forward:
-            return (turn * speed, -turn * speed)
+            forward_duty = speed * self.pivot_forward_percent // 100
+            if turn < 0:
+                return (-speed, forward_duty)
+            if turn > 0:
+                return (forward_duty, -speed)
+            return (0, 0)
         left = right = forward * speed
         if (forward > 0 and turn < 0) or (forward < 0 and turn > 0):
             left = int(left * 0.45)
@@ -149,7 +171,7 @@ class Rover:
         from sphero_sdk import RawMotorModesEnum
         while True:
             tracks = self.tracks()
-            if self.rvr and (tracks != self.last_sent or
+            if self.connected and (tracks != self.last_sent or
                              (tracks != (0, 0) and time.monotonic() - self.last_motor_write >= 0.2)):
                 def mode(value):
                     return (RawMotorModesEnum.forward if value > 0 else
@@ -167,16 +189,16 @@ class Rover:
 
     async def battery_loop(self):
         while True:
-            if self.rvr:
+            if self.connected:
                 try:
-                    self.battery = await self.rvr.get_battery_percentage()
+                    self.battery = await self.rvr.get_battery_percentage(timeout=3)
                 except Exception as exc:
                     self.error = str(exc)
             await asyncio.sleep(10)
 
     async def close(self):
         self.input("")
-        if self.rvr:
+        if self.rvr and self.connected:
             from sphero_sdk import RawMotorModesEnum
             try:
                 off = RawMotorModesEnum.off.value
@@ -185,6 +207,8 @@ class Rover:
                 await self.rvr.restore_default_control_system_timeout()
             finally:
                 await self.rvr.close()
+        elif self.rvr:
+            await self.rvr.close()
 
 
 def packet(kind, payload):
@@ -214,9 +238,10 @@ async def client(reader, writer, camera, rover):
                 last_seq = seq
             now = time.monotonic()
             if now - last_telemetry >= 0.25:
-                info = {"rvr_connected": rover.rvr is not None,
+                info = {"rvr_connected": rover.connected,
                         "keys": rover.last_keys if now - rover.last_command <= 0.5 else "",
                         "tracks": rover.tracks(), "speed_limit": rover.speed,
+                        "pivot_forward_percent": rover.pivot_forward_percent,
                         "battery": rover.battery,
                         "sensors": rover.sensors, "error": rover.error,
                         "camera_sequence": seq}
@@ -242,34 +267,41 @@ async def client(reader, writer, camera, rover):
         LOG.info("Desktop disconnected; motors stopping")
 
 
-async def main(args):
+async def main(args, rover):
     loop = asyncio.get_running_loop()
     main_task = asyncio.current_task()
     loop.add_signal_handler(signal.SIGTERM, main_task.cancel)
     camera = Camera(args.camera, args.width, args.height, args.fps)
-    rover = Rover(args.serial, args.speed)
     camera.start()
-    await rover.connect()
-    motor = asyncio.create_task(rover.motor_loop())
-    battery = asyncio.create_task(rover.battery_loop())
-    lock = asyncio.Lock()
-
-    async def accept(reader, writer):
-        if lock.locked():
-            writer.close()
-            await writer.wait_closed()
-            return
-        async with lock:
-            await client(reader, writer, camera, rover)
-
-    server = await asyncio.start_server(accept, args.host, args.port)
-    LOG.info("Listening at %s:%d", args.host, args.port)
+    motor = battery = None
     try:
+        try:
+            await rover.connect()
+        except Exception as exc:
+            rover.connected = False
+            rover.error = str(exc)
+            LOG.exception("RVR link check failed; camera service remains available")
+        motor = asyncio.create_task(rover.motor_loop())
+        battery = asyncio.create_task(rover.battery_loop())
+        lock = asyncio.Lock()
+
+        async def accept(reader, writer):
+            if lock.locked():
+                writer.close()
+                await writer.wait_closed()
+                return
+            async with lock:
+                await client(reader, writer, camera, rover)
+
+        server = await asyncio.start_server(accept, args.host, args.port)
+        LOG.info("Listening at %s:%d", args.host, args.port)
         async with server:
             await server.serve_forever()
     finally:
-        motor.cancel()
-        battery.cancel()
+        if motor:
+            motor.cancel()
+        if battery:
+            battery.cancel()
         camera.close()
         await rover.close()
 
@@ -283,12 +315,25 @@ if __name__ == "__main__":
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--speed", type=int, default=70)
+    parser.add_argument("--pivot-forward-percent", type=int,
+                        default=int(os.environ.get("EMBODY_PIVOT_FORWARD_PERCENT", "60")))
     parser.add_argument("--serial", default=os.environ.get("EMBODY_RVR_SERIAL", ""))
     args = parser.parse_args()
     if not 1 <= args.speed <= 255:
         parser.error("--speed must be 1..255")
+    if not 0 <= args.pivot_forward_percent <= 100:
+        parser.error("--pivot-forward-percent must be 0..100")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    rover = Rover(args.serial, args.speed, args.pivot_forward_percent)
     try:
-        asyncio.run(main(args))
+        rover.prepare(loop)
+        logging.basicConfig(level=logging.INFO,
+                            format="%(asctime)s %(levelname)s %(message)s", force=True)
+        loop.run_until_complete(main(args, rover))
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
+    finally:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()

@@ -10,6 +10,8 @@ pub struct Telemetry {
     pub tracks: [i16; 2],
     #[serde(default)]
     pub speed_limit: Option<u8>,
+    #[serde(default)]
+    pub pivot_forward_percent: Option<u8>,
     pub battery: Option<Value>,
     pub sensors: Value,
     pub error: Option<String>,
