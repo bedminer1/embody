@@ -112,6 +112,15 @@ focus releases all keys.
   If the rover is off at boot, the ESP32 retries every 5 s (the Pi agent does
   not retry).
 - Only one desktop can be connected at a time.
+- After connecting, the firmware subscribes to the RVR's IMU, locator and
+  velocity streams every 50 ms and reports `pose` (x, y in metres, yaw in
+  degrees) in telemetry, also every 50 ms. A pose older than 300 ms is sent
+  as `null`. If the RVR rejects the stream setup, driving still works and
+  telemetry's `error` says so.
+- `{"vel":[m/s, deg/s]}` drives with the RVR's closed-loop
+  `drive_rc_si_units`, clamped to 1 m/s and 360°/s, and expires after 500 ms
+  like keys. `{"reset_pose":true}` sends `reset_yaw` and
+  `reset_locator_x_and_y`. Neither has been tried on the physical rover yet.
 
 ## Networking caveat
 

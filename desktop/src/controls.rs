@@ -20,6 +20,7 @@ pub struct Controls {
 pub enum Action {
     Continue,
     Stop,
+    ResetPose,
     Quit,
 }
 
@@ -46,6 +47,7 @@ impl Controls {
                 self.pressed.clear();
                 Action::Stop
             }
+            KeyCode::Char('r' | 'R') if event.kind == KeyEventKind::Press => Action::ResetPose,
             KeyCode::Char(key) if "wasd".contains(key.to_ascii_lowercase()) => {
                 let key = key.to_ascii_lowercase();
                 if event.kind == KeyEventKind::Release {

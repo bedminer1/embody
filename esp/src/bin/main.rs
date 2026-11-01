@@ -1,8 +1,9 @@
 //! Embody rover agent for an ESP32: replaces `pi/agent.py` (minus the camera).
 //!
-//! The desktop app connects over TCP (port 8765) and sends WASD key frames;
-//! this firmware turns them into Sphero RVR UART packets and reports
-//! telemetry back. Wi-Fi credentials come from the build environment
+//! The desktop app connects over TCP (port 8765) and sends WASD key frames
+//! or closed-loop velocity commands; this firmware turns them into Sphero RVR
+//! UART packets and reports telemetry, including the RVR's own locator pose,
+//! back. Wi-Fi credentials come from the build environment
 //! (`EMBODY_WIFI_SSID`, `EMBODY_WIFI_PASSWORD`), never from tracked files.
 #![no_std]
 #![no_main]
@@ -29,7 +30,8 @@ use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Ticker, Timer, with_timeout};
 use embody_proto::drive;
 use embody_proto::sphero::{self, Decoder, Frame, Packet};
-use embody_proto::wire::{self, Telemetry};
+use embody_proto::stream::{self, Sample};
+use embody_proto::wire::{self, Command, Pose, Telemetry};
 use esp_backtrace as _;
 use esp_hal::Async;
 use esp_hal::clock::CpuClock;
@@ -77,7 +79,15 @@ const RVR_CONTROL_TIMEOUT_MS: u16 = 750;
 const MOTOR_REFRESH: Duration = Duration::from_millis(200);
 /// Longest the rover task sleeps without a key change (stale-key detection).
 const LOOP_POLL: Duration = Duration::from_millis(20);
-const TELEMETRY_PERIOD: Duration = Duration::from_millis(250);
+/// Telemetry carries the pose the desktop's controller closes its loop on.
+const TELEMETRY_PERIOD: Duration = Duration::from_millis(50);
+/// RVR sensor streaming period (the SDK's minimum is 33 ms).
+const STREAM_PERIOD_MS: u16 = 50;
+/// A pose older than this is reported as unavailable.
+const POSE_STALE: Duration = Duration::from_millis(300);
+/// Velocity command limits; the RVR saturates near 2 m/s and 624 deg/s.
+const MAX_LINEAR: f32 = 1.0;
+const MAX_YAW_RATE: f32 = 360.0;
 const REPLY_TIMEOUT: Duration = Duration::from_millis(1500);
 
 const WIFI_SSID: &str = match option_env!("EMBODY_WIFI_SSID") {
@@ -97,8 +107,23 @@ const WIFI_PASSWORD: &str = match option_env!("EMBODY_WIFI_PASSWORD") {
 
 // ---- state shared between tasks ------------------------------------------
 
+/// What the desktop last asked for.
+#[derive(Clone, Copy, PartialEq)]
+enum Motion {
+    Keys(u8),
+    /// m/s forward, degrees/s counter-clockwise.
+    Velocity(f32, f32),
+}
+
+/// What the rover task should send to the RVR right now.
+#[derive(Clone, Copy, PartialEq)]
+enum Drive {
+    Tracks(i16, i16),
+    Velocity(f32, f32),
+}
+
 struct Shared {
-    keys: u8,
+    motion: Motion,
     last_command: Option<Instant>,
     /// True only after the RVR has answered a battery query.
     rvr_connected: bool,
@@ -107,34 +132,82 @@ struct Shared {
     link_error: Option<&'static str>,
     /// Most recent error the RVR reported for a command.
     fault: Option<(&'static str, Instant)>,
+    /// Why pose streaming is unavailable, if it is.
+    pose_error: Option<&'static str>,
+    /// Latest yaw (degrees) and locator sample, with arrival time.
+    yaw: Option<(f32, Instant)>,
+    position: Option<(Locator, Instant)>,
+}
+
+/// Locator position (m) and velocity (m/s).
+#[derive(Clone, Copy)]
+struct Locator {
+    position: (f32, f32),
+    velocity: (f32, f32),
 }
 
 impl Shared {
     const fn new() -> Self {
         Self {
-            keys: 0,
+            motion: Motion::Keys(0),
             last_command: None,
             rvr_connected: false,
             battery: None,
             link_error: None,
             fault: None,
+            pose_error: None,
+            yaw: None,
+            position: None,
+        }
+    }
+
+    /// The current command, or a stop once it has gone stale.
+    fn drive(&self) -> Drive {
+        match (self.motion, self.last_command) {
+            (_, Some(at)) if at.elapsed() > COMMAND_TIMEOUT => Drive::Tracks(0, 0),
+            (_, None) => Drive::Tracks(0, 0),
+            (Motion::Keys(keys), _) => {
+                let (left, right) =
+                    drive::tracks(keys, SPEED.into(), PIVOT_FORWARD_PERCENT.into());
+                Drive::Tracks(left, right)
+            }
+            (Motion::Velocity(linear, yaw_rate), _) => Drive::Velocity(linear, yaw_rate),
         }
     }
 
     fn tracks(&self) -> (i16, i16) {
-        match self.last_command {
-            Some(at) if at.elapsed() <= COMMAND_TIMEOUT => {
-                drive::tracks(self.keys, SPEED.into(), PIVOT_FORWARD_PERCENT.into())
-            }
-            _ => (0, 0),
+        match self.drive() {
+            Drive::Tracks(left, right) => (left, right),
+            Drive::Velocity(..) => (0, 0),
         }
     }
 
+    fn command_velocity(&self) -> Option<(f32, f32)> {
+        match self.drive() {
+            Drive::Velocity(linear, yaw_rate) => Some((linear, yaw_rate)),
+            Drive::Tracks(..) => None,
+        }
+    }
+
+    fn locator(&self) -> Option<Locator> {
+        self.position
+            .filter(|(_, at)| at.elapsed() <= POSE_STALE)
+            .map(|(locator, _)| locator)
+    }
+
+    fn pose(&self) -> Option<Pose> {
+        let (x, y) = self.locator()?.position;
+        let (yaw, at) = self.yaw?;
+        (at.elapsed() <= POSE_STALE).then_some(Pose { x, y, yaw })
+    }
+
     fn error(&self) -> Option<&'static str> {
-        self.link_error.or(match self.fault {
-            Some((message, at)) if at.elapsed() < Duration::from_secs(3) => Some(message),
-            _ => None,
-        })
+        self.link_error
+            .or(match self.fault {
+                Some((message, at)) if at.elapsed() < Duration::from_secs(3) => Some(message),
+                _ => None,
+            })
+            .or(self.pose_error)
     }
 }
 
@@ -145,22 +218,24 @@ static REPLIES: Channel<CriticalSectionRawMutex, Packet, 4> = Channel::new();
 /// Raised whenever the desired motion may have changed, so the rover task
 /// reacts immediately instead of waiting for its next poll.
 static MOTION_CHANGED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+/// Raised when the desktop asks to zero the locator pose.
+static RESET_POSE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 fn with_shared<R>(f: impl FnOnce(&mut Shared) -> R) -> R {
     SHARED.lock(|shared| f(&mut shared.borrow_mut()))
 }
 
-fn set_keys(keys: u8) {
+fn set_motion(motion: Motion) {
     with_shared(|s| {
-        s.keys = keys;
+        s.motion = motion;
         s.last_command = Some(Instant::now());
     });
     MOTION_CHANGED.signal(());
 }
 
-/// Drop all held keys (link lost or desktop gone) and wake the rover task.
+/// Drop any command (link lost or desktop gone) and wake the rover task.
 fn clear_keys() {
-    with_shared(|s| s.keys = 0);
+    with_shared(|s| s.motion = Motion::Keys(0));
     MOTION_CHANGED.signal(());
 }
 
@@ -334,15 +409,24 @@ async fn read_commands(reader: &mut TcpReader<'_>) {
         {
             return;
         }
-        if let Some(keys) = wire::parse_keys(&payload[..header.len]) {
-            set_keys(keys);
+        match wire::parse_command(&payload[..header.len]) {
+            Some(Command::Keys(keys)) => set_motion(Motion::Keys(keys)),
+            Some(Command::Velocity { linear, yaw_rate }) => set_motion(Motion::Velocity(
+                linear.clamp(-MAX_LINEAR, MAX_LINEAR),
+                yaw_rate.clamp(-MAX_YAW_RATE, MAX_YAW_RATE),
+            )),
+            Some(Command::ResetPose) => {
+                RESET_POSE.signal(());
+                MOTION_CHANGED.signal(());
+            }
+            None => {}
         }
     }
 }
 
 async fn send_telemetry(writer: &mut TcpWriter<'_>) {
     let mut ticker = Ticker::every(TELEMETRY_PERIOD);
-    let mut frame = [0u8; 256];
+    let mut frame = [0u8; 512];
     loop {
         let len = with_shared(|s| {
             wire::encode_telemetry(
@@ -353,6 +437,9 @@ async fn send_telemetry(writer: &mut TcpWriter<'_>) {
                     speed_limit: SPEED,
                     pivot_forward_percent: PIVOT_FORWARD_PERCENT,
                     battery_percentage: s.battery,
+                    pose: s.pose(),
+                    velocity: s.locator().map(|locator| locator.velocity),
+                    command_velocity: s.command_velocity(),
                     error: s.error(),
                 },
             )
@@ -405,6 +492,15 @@ async fn uart_reader(mut rx: UartRx<'static, Async>) {
                         {
                             with_shared(|s| s.battery = Some(percentage));
                         }
+                        if !packet.is_response() {
+                            if packet.did == sphero::DID_SENSOR
+                                && packet.cid == sphero::CID_STREAMING_DATA
+                            {
+                                store_sample(stream::parse(packet.data()));
+                            }
+                            // Notifications never answer a request.
+                            continue;
+                        }
                         // Full queue means nobody is waiting; drop the packet.
                         let _ = REPLIES.try_send(packet);
                     }
@@ -416,6 +512,21 @@ async fn uart_reader(mut rx: UartRx<'static, Async>) {
             }
         }
     }
+}
+
+fn store_sample(sample: Option<Sample>) {
+    let now = Instant::now();
+    with_shared(|s| match sample {
+        Some(Sample::Attitude { yaw, .. }) => s.yaw = Some((yaw, now)),
+        Some(Sample::Motion { x, y, vx, vy }) => {
+            let locator = Locator {
+                position: (x, y),
+                velocity: (vx, vy),
+            };
+            s.position = Some((locator, now));
+        }
+        None => {}
+    });
 }
 
 struct Rvr {
@@ -484,6 +595,55 @@ impl Rvr {
             .ok_or("RVR did not accept the control timeout")?;
         Ok(percentage)
     }
+
+    /// Send a command that must be acknowledged without error.
+    async fn confirm(&mut self, build: impl FnOnce(u8) -> Frame) -> bool {
+        self.request(build)
+            .await
+            .is_some_and(|reply| reply.error == 0)
+    }
+
+    /// Subscribe to attitude, locator and velocity on the ST processor.
+    /// Driving still works without these; only pose-based skills need them.
+    async fn start_streaming(&mut self) -> Result<(), &'static str> {
+        // Clearing an empty configuration may be rejected; that is harmless.
+        let _ = self.request(sphero::clear_streaming).await;
+        let configured = self
+            .confirm(|seq| {
+                sphero::configure_streaming(seq, stream::TOKEN_ATTITUDE, stream::ATTITUDE_SERVICES)
+            })
+            .await
+            && self
+                .confirm(|seq| {
+                    sphero::configure_streaming(seq, stream::TOKEN_MOTION, stream::MOTION_SERVICES)
+                })
+                .await;
+        if !configured {
+            return Err("RVR rejected the pose stream configuration");
+        }
+        if !self
+            .confirm(|seq| sphero::start_streaming(seq, STREAM_PERIOD_MS))
+            .await
+        {
+            return Err("RVR did not start pose streaming");
+        }
+        Ok(())
+    }
+
+    /// Make the current position (0, 0) and the current heading yaw 0.
+    async fn reset_pose(&mut self) {
+        let ok = self.confirm(sphero::reset_yaw).await && self.confirm(sphero::reset_locator).await;
+        if ok {
+            info!("Pose reset");
+            with_shared(|s| {
+                s.yaw = None;
+                s.position = None;
+            });
+        } else {
+            warn!("Pose reset failed");
+            with_shared(|s| s.fault = Some(("RVR rejected the pose reset", Instant::now())));
+        }
+    }
 }
 
 #[embassy_executor::task]
@@ -511,16 +671,31 @@ async fn rover(tx: UartTx<'static, Async>) {
         }
     }
 
-    let mut last_sent: Option<(i16, i16)> = None;
+    match rvr.start_streaming().await {
+        Ok(()) => info!("RVR pose streaming every {STREAM_PERIOD_MS} ms"),
+        Err(message) => {
+            warn!("{message}");
+            with_shared(|s| s.pose_error = Some(message));
+        }
+    }
+
+    let mut last_sent: Option<Drive> = None;
     let mut last_write = Instant::now();
     let mut battery_poll = Instant::now();
     loop {
-        let tracks = with_shared(|s| s.tracks());
-        let moving = tracks != (0, 0);
-        if last_sent != Some(tracks) || (moving && last_write.elapsed() >= MOTOR_REFRESH) {
+        if RESET_POSE.try_take().is_some() {
+            rvr.reset_pose().await;
+        }
+        let command = with_shared(|s| s.drive());
+        let moving = command != Drive::Tracks(0, 0);
+        if last_sent != Some(command) || (moving && last_write.elapsed() >= MOTOR_REFRESH) {
             let seq = rvr.next_seq();
-            rvr.send(sphero::raw_motors(seq, tracks.0, tracks.1)).await;
-            last_sent = Some(tracks);
+            let frame = match command {
+                Drive::Tracks(left, right) => sphero::raw_motors(seq, left, right),
+                Drive::Velocity(linear, yaw_rate) => sphero::drive_rc_si(seq, linear, yaw_rate),
+            };
+            rvr.send(frame).await;
+            last_sent = Some(command);
             last_write = Instant::now();
         } else if battery_poll.elapsed() >= Duration::from_secs(10) {
             // Fire and forget: `uart_reader` stores the answer, so a slow or

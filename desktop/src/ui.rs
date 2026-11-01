@@ -24,6 +24,7 @@ struct View {
     fixed_speed: Option<u8>,
     pivot_forward_percent: Option<u8>,
     status: String,
+    pose: String,
     size: (u16, u16),
 }
 
@@ -73,8 +74,16 @@ impl Dashboard {
             Some(_) => "Camera only · rover not connected",
             None => "Connecting...",
         };
+        let pose = match telemetry.and_then(|data| data.pose) {
+            Some(pose) => format!(
+                "Pose  x {:+6.2} m   y {:+6.2} m   yaw {:+5.0}°     R reset",
+                pose.x, pose.y, pose.yaw
+            ),
+            None => "Pose  unavailable".to_string(),
+        };
         let view = View {
             keys: keys.to_string(),
+            pose: pose.clone(),
             tracks,
             fixed_speed,
             pivot_forward_percent,
@@ -102,7 +111,7 @@ impl Dashboard {
             Color::Cyan,
         )?;
         self.border(2, '├', '┤')?;
-        self.line(3, "", Color::White)?;
+        self.line(3, &pose, Color::DarkGrey)?;
         self.line(
             4,
             &format!(

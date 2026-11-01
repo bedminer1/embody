@@ -26,14 +26,23 @@ const TARGET_ST: u8 = 2;
 
 pub const DID_POWER: u8 = 0x13;
 const DID_DRIVE: u8 = 0x16;
+pub const DID_SENSOR: u8 = 0x18;
 
 const CID_WAKE: u8 = 0x0D;
 pub const CID_BATTERY_PERCENTAGE: u8 = 0x10;
 const CID_RAW_MOTORS: u8 = 0x01;
+const CID_RESET_YAW: u8 = 0x06;
 const CID_SET_CONTROL_TIMEOUT: u8 = 0x22;
+const CID_DRIVE_RC_SI: u8 = 0x34;
+
+const CID_RESET_LOCATOR: u8 = 0x13;
+const CID_CONFIGURE_STREAMING: u8 = 0x39;
+const CID_START_STREAMING: u8 = 0x3A;
+const CID_CLEAR_STREAMING: u8 = 0x3C;
+pub const CID_STREAMING_DATA: u8 = 0x3D;
 
 /// Largest payload this module will encode.
-const MAX_PAYLOAD: usize = 8;
+const MAX_PAYLOAD: usize = 16;
 /// Worst case: SOP + every byte of (flags, target, did, cid, seq, payload,
 /// checksum) escaped + EOP.
 pub const MAX_FRAME: usize = 2 + 2 * (5 + MAX_PAYLOAD + 1);
@@ -147,7 +156,88 @@ pub fn raw_motors(seq: u8, left: i16, right: i16) -> Frame {
     )
 }
 
-const MAX_REPLY_DATA: usize = 16;
+/// `drive.reset_yaw`: the current heading becomes yaw 0.
+pub fn reset_yaw(seq: u8) -> Frame {
+    encode(TARGET_ST, DID_DRIVE, CID_RESET_YAW, seq, Reply::Always, &[])
+}
+
+/// `sensor.reset_locator_x_and_y`: the current position becomes (0, 0).
+pub fn reset_locator(seq: u8) -> Frame {
+    encode(
+        TARGET_ST,
+        DID_SENSOR,
+        CID_RESET_LOCATOR,
+        seq,
+        Reply::Always,
+        &[],
+    )
+}
+
+/// `drive.drive_rc_si_units`: closed-loop linear velocity (m/s, forward
+/// positive) and yaw rate (degrees/s, counter-clockwise positive seen from
+/// above). The RVR only answers if the command fails.
+pub fn drive_rc_si(seq: u8, linear: f32, yaw_rate: f32) -> Frame {
+    let mut payload = [0u8; 9];
+    payload[..4].copy_from_slice(&yaw_rate.to_be_bytes());
+    payload[4..8].copy_from_slice(&linear.to_be_bytes());
+    encode(
+        TARGET_ST,
+        DID_DRIVE,
+        CID_DRIVE_RC_SI,
+        seq,
+        Reply::OnError,
+        &payload,
+    )
+}
+
+/// `sensor.clear_streaming_service` on the ST processor, which hosts the
+/// IMU, locator and velocity services.
+pub fn clear_streaming(seq: u8) -> Frame {
+    encode(
+        TARGET_ST,
+        DID_SENSOR,
+        CID_CLEAR_STREAMING,
+        seq,
+        Reply::Always,
+        &[],
+    )
+}
+
+/// `sensor.configure_streaming_service`: put `services` (service id, data
+/// size code) into the slot `token` on the ST processor. At most five.
+pub fn configure_streaming(seq: u8, token: u8, services: &[(u16, u8)]) -> Frame {
+    assert!(services.len() <= 5);
+    let mut payload = [0u8; 16];
+    payload[0] = token;
+    for (i, (id, size)) in services.iter().enumerate() {
+        let at = 1 + 3 * i;
+        payload[at..at + 2].copy_from_slice(&id.to_be_bytes());
+        payload[at + 2] = *size;
+    }
+    encode(
+        TARGET_ST,
+        DID_SENSOR,
+        CID_CONFIGURE_STREAMING,
+        seq,
+        Reply::Always,
+        &payload[..1 + 3 * services.len()],
+    )
+}
+
+/// `sensor.start_streaming_service` on the ST processor, every `period_ms`.
+pub fn start_streaming(seq: u8, period_ms: u16) -> Frame {
+    encode(
+        TARGET_ST,
+        DID_SENSOR,
+        CID_START_STREAMING,
+        seq,
+        Reply::Always,
+        &period_ms.to_be_bytes(),
+    )
+}
+
+/// Streaming notifications carry a token byte plus up to 16 data bytes.
+const MAX_REPLY_DATA: usize = 32;
 
 /// A packet received from the RVR (command response or notification).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,7 +264,7 @@ impl Packet {
 
 /// Incremental parser: feed it bytes from the UART as they arrive.
 pub struct Decoder {
-    buf: [u8; 32],
+    buf: [u8; 64],
     len: usize,
     in_packet: bool,
     escaped: bool,
@@ -189,7 +279,7 @@ impl Default for Decoder {
 impl Decoder {
     pub const fn new() -> Self {
         Self {
-            buf: [0; 32],
+            buf: [0; 64],
             len: 0,
             in_packet: false,
             escaped: false,
@@ -349,6 +439,35 @@ mod tests {
         assert!(!packet.is_response());
         assert_eq!((packet.did, packet.cid, packet.seq), (0x16, 0x01, 0x8D));
         assert_eq!(packet.data(), [1, 0xAB, 0, 0]);
+    }
+
+    #[test]
+    fn drive_rc_si_puts_yaw_rate_first() {
+        let frame = drive_rc_si(1, 0.5, -90.0);
+        let mut decoder = Decoder::new();
+        let packet = frame
+            .as_bytes()
+            .iter()
+            .find_map(|b| decoder.push(*b))
+            .expect("packet");
+        assert_eq!((packet.did, packet.cid), (0x16, 0x34));
+        let data = packet.data();
+        assert_eq!(f32::from_be_bytes(data[..4].try_into().unwrap()), -90.0);
+        assert_eq!(f32::from_be_bytes(data[4..8].try_into().unwrap()), 0.5);
+        assert_eq!(data[8], 0);
+    }
+
+    #[test]
+    fn configure_streaming_lists_services() {
+        let frame = configure_streaming(2, 2, &[(0x0006, 2), (0x0007, 2)]);
+        let mut decoder = Decoder::new();
+        let packet = frame
+            .as_bytes()
+            .iter()
+            .find_map(|b| decoder.push(*b))
+            .expect("packet");
+        assert_eq!((packet.did, packet.cid), (0x18, 0x39));
+        assert_eq!(packet.data(), [2, 0x00, 0x06, 2, 0x00, 0x07, 2]);
     }
 
     #[test]

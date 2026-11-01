@@ -10,6 +10,17 @@
 
 The RVR UART connection, SDK wake, battery query, live sensor readings, LED control, and a short forward motor pulse have been confirmed. A/D pivots drift forward on the current surface, so the forward track duty during pivots is now independently adjustable. Verify the new balance on a clear floor, then check stop on `Space`, desktop exit, SSH disconnect, and Pi service restart.
 
+## Navigation (odometry, skills, language tasks)
+
+Implemented, simulator-tested, not yet tried on the rover: the ESP32 firmware and Pi agent stream the RVR locator pose and accept `vel` and `reset_pose`; the desktop JSON mode runs `drive`, `turn`, `turn_to` and `go_to` skills on that pose, plus named places; `brain/embody_brain.py` exposes them to Claude as tools. The Pi agent changes are not deployed.
+
+Next, on raised tracks first, then a clear floor:
+
+1. Flash the ESP32 (or deploy `pi/agent.py`) and confirm that telemetry shows a changing `pose` when the rover is pushed by hand.
+2. Check the sign conventions: a `vel` of `[0.2, 0]` should raise `y`, and `[0, 30]` should turn left and raise yaw. The code assumes Sphero's documented convention (yaw 0 faces +y, counter-clockwise positive, +x to the right) and that IMU yaw resets with `reset_yaw`.
+3. Measure odometry drift: a 1 m `drive`, a 90° `turn` and a 1 m square with `go_to`, checked with a tape measure. Tune gains and tolerances in `desktop/src/nav.rs` against the real response.
+4. Then perception: camera calibration, monocular depth turned into an obstacle scan, a safety stop, and AprilTag pose corrections.
+
 ## LLM and perception
 
 The Rust desktop program now provides human teleoperation plus a newline-delimited JSON interface for bounded `keys`, `stop`, telemetry, and snapshots. Next, adapt the target LLM runtime to this interface. Keep the Pi server as the sole RVR command owner. Add a separate low-rate frame sampler (for example 2–5 fps) feeding YOLO; keep the full-rate video path for the human view. Implement the red-ball behavior in steps: detection, bearing/distance estimate, orbit controller, then supervised trial. Record camera and RVR data to tune the controller. Isaac Lab simulation can follow once the physical interface and geometry are measured.

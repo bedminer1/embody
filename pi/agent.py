@@ -11,7 +11,6 @@ import subprocess
 import threading
 import time
 
-
 LOG = logging.getLogger("embody.pi")
 MAX_PACKET = 64 * 1024
 
@@ -101,6 +100,8 @@ class Rover:
         self.connected = False
         self.sensors = {}
         self.last_keys = ""
+        self.velocity = None  # (m/s, deg/s) from a "vel" command, else keys
+        self.reset_requested = False
         self.last_command = 0.0
         self.last_sent = None
         self.last_motor_write = 0.0
@@ -110,7 +111,7 @@ class Rover:
     def prepare(self, loop):
         if not self.port:
             return
-        from sphero_sdk import SpheroRvrAsync, SerialAsyncDal
+        from sphero_sdk import SerialAsyncDal, SpheroRvrAsync
         # The official SDK runs its firmware check in the constructor, so
         # construction must happen before this event loop starts running.
         self.rvr = SpheroRvrAsync(dal=SerialAsyncDal(loop, port_id=self.port))
@@ -132,22 +133,57 @@ class Rover:
         LOG.info("RVR battery response: %s", battery)
         await self.rvr.set_custom_control_system_timeout(command_timeout=750)
         async def handler(name, data):
-            self.sensors[name] = data
+            # The SDK passes every service of the notification; keep this one.
+            self.sensors[name] = dict(data.get(name, data), time=time.monotonic())
         for name in (RvrStreamingServices.imu, RvrStreamingServices.accelerometer,
                      RvrStreamingServices.encoders, RvrStreamingServices.ambient_light,
-                     RvrStreamingServices.color_detection):
+                     RvrStreamingServices.color_detection, RvrStreamingServices.locator,
+                     RvrStreamingServices.velocity):
             async def callback(data, name=name):
                 await handler(name, data)
             await self.rvr.sensor_control.add_sensor_data_handler(service=name, handler=callback)
-        await self.rvr.sensor_control.start(interval=250)
+        # The desktop's skill controller closes its loop on this pose.
+        await self.rvr.sensor_control.start(interval=50)
         LOG.info("RVR connected on %s", self.port)
 
     def input(self, keys):
         self.last_keys = "".join(k for k in keys.lower() if k in "wasd")
+        self.velocity = None
         self.last_command = time.monotonic()
 
+    def command(self, data):
+        """Apply one control payload: keys, vel [m/s, deg/s] or reset_pose."""
+        if data.get("reset_pose") is True:
+            self.reset_requested = True
+        elif isinstance(data.get("vel"), list) and len(data["vel"]) == 2:
+            linear, yaw_rate = (float(value) for value in data["vel"])
+            self.last_keys = ""
+            self.velocity = (max(-1.0, min(1.0, linear)), max(-360.0, min(360.0, yaw_rate)))
+            self.last_command = time.monotonic()
+        else:
+            self.input(data.get("keys", ""))
+
+    def command_velocity(self):
+        if self.velocity is None or time.monotonic() - self.last_command > 0.5:
+            return None
+        return self.velocity
+
+    def pose(self):
+        """Fresh locator pose (m, m, degrees CCW), or None."""
+        now = time.monotonic()
+        imu, locator = self.sensors.get("IMU"), self.sensors.get("Locator")
+        if not imu or not locator or now - min(imu["time"], locator["time"]) > 0.3:
+            return None
+        return {"x": locator["X"], "y": locator["Y"], "yaw": imu["Yaw"]}
+
+    def measured_velocity(self):
+        velocity = self.sensors.get("Velocity")
+        if not velocity or time.monotonic() - velocity["time"] > 0.3:
+            return None
+        return [velocity["X"], velocity["Y"]]
+
     def tracks(self):
-        if time.monotonic() - self.last_command > 0.5:
+        if time.monotonic() - self.last_command > 0.5 or self.velocity is not None:
             return (0, 0)
         keys = self.last_keys
         speed = self.speed
@@ -169,18 +205,34 @@ class Rover:
 
     async def motor_loop(self):
         from sphero_sdk import RawMotorModesEnum
+        def mode(value):
+            return (RawMotorModesEnum.forward if value > 0 else
+                    RawMotorModesEnum.reverse if value < 0 else RawMotorModesEnum.off).value
         while True:
-            tracks = self.tracks()
-            if self.connected and (tracks != self.last_sent or
-                             (tracks != (0, 0) and time.monotonic() - self.last_motor_write >= 0.2)):
-                def mode(value):
-                    return (RawMotorModesEnum.forward if value > 0 else
-                            RawMotorModesEnum.reverse if value < 0 else RawMotorModesEnum.off).value
+            if self.connected and self.reset_requested:
+                self.reset_requested = False
                 try:
-                    await self.rvr.raw_motors(mode(tracks[0]), abs(tracks[0]),
-                                              mode(tracks[1]), abs(tracks[1]))
+                    await self.rvr.reset_yaw()
+                    await self.rvr.reset_locator_x_and_y()
+                    LOG.info("Pose reset")
+                except Exception as exc:
+                    self.error = str(exc)
+                    LOG.exception("Pose reset failed")
+            velocity = self.command_velocity()
+            target = ("vel", velocity) if velocity else ("tracks", self.tracks())
+            moving = target != ("tracks", (0, 0))
+            if self.connected and (target != self.last_sent or
+                             (moving and time.monotonic() - self.last_motor_write >= 0.2)):
+                try:
+                    if velocity:
+                        await self.rvr.drive_rc_si_units(
+                            yaw_angular_velocity=velocity[1], linear_velocity=velocity[0], flags=0)
+                    else:
+                        tracks = target[1]
+                        await self.rvr.raw_motors(mode(tracks[0]), abs(tracks[0]),
+                                                  mode(tracks[1]), abs(tracks[1]))
                     self.error = None
-                    self.last_sent = tracks
+                    self.last_sent = target
                     self.last_motor_write = time.monotonic()
                 except Exception as exc:
                     self.error = str(exc)
@@ -226,7 +278,7 @@ async def client(reader, writer, camera, rover):
             if header[:1] != b"C" or length > MAX_PACKET:
                 raise ValueError("Invalid control packet")
             data = json.loads(await reader.readexactly(length))
-            rover.input(data.get("keys", ""))
+            rover.command(data)
 
     async def transmit():
         last_seq = -1
@@ -237,12 +289,14 @@ async def client(reader, writer, camera, rover):
                 writer.write(packet(b"V", frame))
                 last_seq = seq
             now = time.monotonic()
-            if now - last_telemetry >= 0.25:
+            if now - last_telemetry >= 0.05:
                 info = {"rvr_connected": rover.connected,
                         "keys": rover.last_keys if now - rover.last_command <= 0.5 else "",
                         "tracks": rover.tracks(), "speed_limit": rover.speed,
                         "pivot_forward_percent": rover.pivot_forward_percent,
-                        "battery": rover.battery,
+                        "battery": rover.battery, "pose": rover.pose(),
+                        "velocity": rover.measured_velocity(),
+                        "vel": rover.command_velocity(),
                         "sensors": rover.sensors, "error": rover.error,
                         "camera_sequence": seq}
                 writer.write(packet(b"T", json.dumps(info, default=str).encode()))

@@ -1,4 +1,5 @@
 use crate::protocol::{self, Incoming, Telemetry};
+use serde_json::json;
 use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Command, Stdio};
@@ -97,7 +98,17 @@ impl Connection {
     }
 
     pub fn send_keys(&mut self, keys: &str) -> io::Result<()> {
-        protocol::send_keys(&mut self.writer, keys)
+        protocol::send_control(&mut self.writer, &json!({ "keys": keys }))
+    }
+
+    /// Closed-loop velocity: m/s forward, degrees/s counter-clockwise.
+    pub fn send_velocity(&mut self, linear: f64, yaw_rate: f64) -> io::Result<()> {
+        protocol::send_control(&mut self.writer, &json!({ "vel": [linear, yaw_rate] }))
+    }
+
+    /// Make the rover's current position (0, 0) and its heading yaw 0.
+    pub fn reset_pose(&mut self) -> io::Result<()> {
+        protocol::send_control(&mut self.writer, &json!({ "reset_pose": true }))
     }
 
     pub fn update(&self) -> Update {
