@@ -1,0 +1,7 @@
+[package]
+name = "embody-proto"
+version = "0.1.0"
+edition = "2021"
+description = "no_std Sphero RVR packet codec and Embody desktop wire format; unit-testable on the host"
+
+[dependencies]

@@ -1,5 +1,9 @@
 use crate::protocol::Telemetry;
 use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::event::{
+    DisableFocusChange, EnableFocusChange, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::style::{Color, Print, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
@@ -9,6 +13,7 @@ const INNER_WIDTH: usize = 60;
 
 pub struct Dashboard {
     out: Stdout,
+    release_events: bool,
     previous: Option<View>,
 }
 
@@ -30,10 +35,30 @@ impl Dashboard {
             let _ = execute!(out, Show, LeaveAlternateScreen);
             return Err(error);
         }
+        // Ask for key press/repeat/release events so several held keys work.
+        // Terminals without the kitty keyboard protocol ignore this.
+        let release_events = terminal::supports_keyboard_enhancement().unwrap_or(false);
+        if release_events {
+            let _ = execute!(
+                out,
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                )
+            );
+        }
+        let _ = execute!(out, EnableFocusChange);
         Ok(Self {
             out,
+            release_events,
             previous: None,
         })
+    }
+
+    /// Whether the terminal reports key releases (needed for reliable
+    /// multi-key driving).
+    pub fn release_events(&self) -> bool {
+        self.release_events
     }
 
     pub fn draw(&mut self, keys: &str, telemetry: Option<&Telemetry>) -> io::Result<()> {
@@ -43,7 +68,7 @@ impl Dashboard {
         let pivot_forward_percent = telemetry.and_then(|data| data.pivot_forward_percent);
         let tracks = telemetry.map_or([0, 0], |data| data.tracks);
         let motor_status = match telemetry {
-            Some(data) if data.error.is_some() => "Motor error · check Pi service",
+            Some(data) if data.error.is_some() => "Motor error · check rover agent",
             Some(data) if data.rvr_connected => "Motor link ready",
             Some(_) => "Camera only · rover not connected",
             None => "Connecting...",
@@ -104,7 +129,15 @@ impl Dashboard {
         )?;
         self.line(7, &track_row("LEFT ", tracks[0]), Color::Green)?;
         self.line(8, &track_row("RIGHT", tracks[1]), Color::Green)?;
-        self.line(9, "", Color::White)?;
+        if self.release_events {
+            self.line(9, "", Color::White)?;
+        } else {
+            self.line(
+                9,
+                "No key-release events: use Ghostty/kitty/WezTerm/iTerm2 to hold several keys",
+                Color::Yellow,
+            )?;
+        }
         self.line(10, &format!("Motion  {:<30}", motion(keys)), Color::White)?;
         self.line(
             11,
@@ -145,6 +178,10 @@ impl Dashboard {
 
 impl Drop for Dashboard {
     fn drop(&mut self) {
+        let _ = execute!(self.out, DisableFocusChange);
+        if self.release_events {
+            let _ = execute!(self.out, PopKeyboardEnhancementFlags);
+        }
         let _ = terminal::disable_raw_mode();
         let _ = execute!(
             self.out,
