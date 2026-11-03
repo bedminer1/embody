@@ -3,7 +3,7 @@
 //! the payload. The desktop sends `C` frames carrying one of
 //! `{"keys":"wa"}`, `{"vel":[0.3,-20.0]}` (m/s, degrees/s) or
 //! `{"reset_pose":true}`; the rover answers with `T` telemetry frames
-//! carrying JSON.
+//! carrying JSON and, when it has a camera, `V` frames carrying one JPEG each.
 
 use core::fmt::{self, Write};
 
@@ -14,12 +14,19 @@ pub const HEADER_LEN: usize = 5;
 pub const MAX_CONTROL: usize = 256;
 pub const CONTROL: u8 = b'C';
 pub const TELEMETRY: u8 = b'T';
+pub const VIDEO: u8 = b'V';
 
 /// Parsed frame header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header {
     pub kind: u8,
     pub len: usize,
+}
+
+/// Header for a frame of `kind` carrying `len` payload bytes.
+pub fn header(kind: u8, len: usize) -> [u8; HEADER_LEN] {
+    let len = (len as u32).to_be_bytes();
+    [kind, len[0], len[1], len[2], len[3]]
 }
 
 pub fn parse_header(bytes: [u8; HEADER_LEN]) -> Header {
@@ -259,6 +266,7 @@ mod tests {
 
     #[test]
     fn header_round_trip() {
+        assert_eq!(header(VIDEO, 258), [b'V', 0, 0, 1, 2]);
         let header = parse_header([b'C', 0, 0, 1, 2]);
         assert_eq!(
             header,

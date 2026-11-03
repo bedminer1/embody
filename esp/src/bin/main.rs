@@ -1,9 +1,9 @@
-//! Embody rover agent for an ESP32: replaces `pi/agent.py` (minus the camera).
+//! Embody rover agent for an ESP32-S3 camera board: replaces `pi/agent.py`.
 //!
 //! The desktop app connects over TCP (port 8765) and sends WASD key frames
 //! or closed-loop velocity commands; this firmware turns them into Sphero RVR
 //! UART packets and reports telemetry, including the RVR's own locator pose,
-//! back. Wi-Fi credentials come from the build environment
+//! back, along with JPEG frames from the board's OV2640 camera. Wi-Fi credentials come from the build environment
 //! (`EMBODY_WIFI_SSID`, `EMBODY_WIFI_PASSWORD`), never from tracked files.
 #![no_std]
 #![no_main]
@@ -35,6 +35,10 @@ use embody_proto::wire::{self, Command, Pose, Telemetry};
 use esp_backtrace as _;
 use esp_hal::Async;
 use esp_hal::clock::CpuClock;
+use esp_hal::i2c::master::{Config as I2cConfig, I2c};
+use esp_hal::lcd_cam::LcdCam;
+use esp_hal::lcd_cam::cam::{Camera, Config as CameraConfig, VsyncFilterThreshold};
+use esp_hal::time::Rate;
 use esp_hal::rng::Rng;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::uart::{Config as UartConfig, Uart, UartRx, UartTx};
@@ -46,22 +50,11 @@ use static_cell::StaticCell;
 
 extern crate alloc;
 
+mod camera;
+
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
-
-// esp-radio 0.17 defines these two NVS hooks only for Xtensa chips, but the
-// Wi-Fi library also references them once the station is started on the
-// ESP32-C6, which breaks linking. These are the same no-op bodies it uses on
-// Xtensa (no persistent Wi-Fi storage). If a future esp-radio defines them for
-// RISC-V too, the linker reports a duplicate symbol; delete these then.
-#[unsafe(no_mangle)]
-extern "C" fn __esp_radio_misc_nvs_init() -> i32 {
-    0
-}
-
-#[unsafe(no_mangle)]
-extern "C" fn __esp_radio_misc_nvs_deinit() {}
 
 // ---- configuration -------------------------------------------------------
 
@@ -99,11 +92,18 @@ const WIFI_PASSWORD: &str = match option_env!("EMBODY_WIFI_PASSWORD") {
     None => "",
 };
 
-// RVR UART: UART1 on GPIO18 (TX) and GPIO19 (RX). The pins are chosen in
-// `main` (`with_tx` / `with_rx`); any free GPIO works because the ESP32-C6
-// routes UART signals through its pin matrix. Avoid the strapping pins
-// (GPIO4/5/8/9/15), USB (GPIO12/13), the flash pins and the console UART0
-// pins (GPIO16/17). Cross the wires: ESP TX -> RVR RX, ESP RX <- RVR TX.
+// RVR UART: UART1 on GPIO21 (TX) and GPIO14 (RX). The pins are chosen in
+// `main` (`with_tx` / `with_rx`); any free GPIO works because the ESP32-S3
+// routes UART signals through its GPIO matrix. Avoid the camera pins (below),
+// the strapping pins (GPIO0/3/45/46), native USB (GPIO19/20), the console
+// UART0 (GPIO43/44), octal PSRAM (GPIO35-37) and the RGB LED (GPIO48 on most
+// boards). Cross the wires: ESP TX -> RVR RX, ESP RX <- RVR TX.
+//
+// Camera: the pin map shared by the common "ESP32-S3 CAM" / ESP32-S3-WROOM
+// camera boards (Freenove and its clones; `CAMERA_MODEL_ESP32S3_EYE` in the
+// Arduino examples): XCLK 15, SIOD 4, SIOC 5, VSYNC 6, HREF 7, PCLK 13,
+// D0-D7 = 11, 9, 8, 10, 12, 18, 17, 16, no PWDN or RESET line. Check your
+// board's schematic; other boards (e.g. the XIAO ESP32S3 Sense) differ.
 
 // ---- state shared between tasks ------------------------------------------
 
@@ -134,6 +134,8 @@ struct Shared {
     fault: Option<(&'static str, Instant)>,
     /// Why pose streaming is unavailable, if it is.
     pose_error: Option<&'static str>,
+    /// Why the camera is not streaming, if it is not.
+    camera_error: Option<&'static str>,
     /// Latest yaw (degrees) and locator sample, with arrival time.
     yaw: Option<(f32, Instant)>,
     position: Option<(Locator, Instant)>,
@@ -156,6 +158,7 @@ impl Shared {
             link_error: None,
             fault: None,
             pose_error: None,
+            camera_error: None,
             yaw: None,
             position: None,
         }
@@ -208,6 +211,7 @@ impl Shared {
                 _ => None,
             })
             .or(self.pose_error)
+            .or(self.camera_error)
     }
 }
 
@@ -233,6 +237,10 @@ fn set_motion(motion: Motion) {
     MOTION_CHANGED.signal(());
 }
 
+fn report_camera(error: Option<&'static str>) {
+    with_shared(|s| s.camera_error = error);
+}
+
 /// Drop any command (link lost or desktop gone) and wake the rover task.
 fn clear_keys() {
     with_shared(|s| s.motion = Motion::Keys(0));
@@ -255,9 +263,7 @@ async fn main(spawner: Spawner) -> ! {
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 65536);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
-    let sw_interrupt =
-        esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
-    esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
+    esp_rtos::start(timg0.timer0);
 
     if WIFI_SSID.is_empty() {
         panic!("EMBODY_WIFI_SSID was not set when this firmware was built");
@@ -270,14 +276,47 @@ async fn main(spawner: Spawner) -> ! {
         UartConfig::default().with_baudrate(115_200),
     )
     .expect("invalid UART config")
-    .with_rx(peripherals.GPIO19)
-    .with_tx(peripherals.GPIO18)
+    .with_rx(peripherals.GPIO14)
+    .with_tx(peripherals.GPIO21)
     .into_async()
     .split();
     spawner
         .spawn(uart_reader(rx))
         .expect("failed to spawn task");
     spawner.spawn(rover(tx)).expect("failed to spawn task");
+
+    // Camera: 20 MHz XCLK, as in Espressif's driver. A missing or failed
+    // camera only disables video; driving does not depend on it.
+    let lcd_cam = LcdCam::new(peripherals.LCD_CAM);
+    let camera_config = CameraConfig::default()
+        .with_frequency(Rate::from_mhz(20))
+        .with_vsync_filter_threshold(VsyncFilterThreshold::Four);
+    let camera = Camera::new(lcd_cam.cam, peripherals.DMA_CH0, camera_config)
+        .expect("invalid camera config")
+        .with_master_clock(peripherals.GPIO15)
+        .with_pixel_clock(peripherals.GPIO13)
+        .with_vsync(peripherals.GPIO6)
+        .with_h_enable(peripherals.GPIO7)
+        .with_data0(peripherals.GPIO11)
+        .with_data1(peripherals.GPIO9)
+        .with_data2(peripherals.GPIO8)
+        .with_data3(peripherals.GPIO10)
+        .with_data4(peripherals.GPIO12)
+        .with_data5(peripherals.GPIO18)
+        .with_data6(peripherals.GPIO17)
+        .with_data7(peripherals.GPIO16);
+    let sccb = I2c::new(
+        peripherals.I2C0,
+        I2cConfig::default().with_frequency(Rate::from_khz(100)),
+    )
+    .expect("invalid I2C config")
+    .with_sda(peripherals.GPIO4)
+    .with_scl(peripherals.GPIO5);
+    // A ring of DMA descriptors with about 50 ms of headroom at VGA.
+    let stream = esp_hal::dma_rx_stream_buffer!(40_000, 4000);
+    spawner
+        .spawn(camera::run(camera, sccb, stream, report_camera))
+        .expect("failed to spawn task");
 
     // Wi-Fi + network stack.
     static RADIO: StaticCell<esp_radio::Controller<'static>> = StaticCell::new();
@@ -305,7 +344,7 @@ async fn main(spawner: Spawner) -> ! {
         .spawn(tcp_server(stack))
         .expect("failed to spawn task");
 
-    info!("Embody ESP32 agent started");
+    info!("Embody ESP32-S3 agent started");
     loop {
         Timer::after(Duration::from_secs(3600)).await;
     }
@@ -357,7 +396,8 @@ async fn net_runner(mut runner: Runner<'static, WifiDevice<'static>>) {
 #[embassy_executor::task]
 async fn tcp_server(stack: Stack<'static>) {
     let mut rx_buffer = [0u8; 1024];
-    let mut tx_buffer = [0u8; 1024];
+    // Room for a good part of a JPEG frame, so video keeps the link busy.
+    let mut tx_buffer = [0u8; 16 * 1024];
     loop {
         stack.wait_config_up().await;
         if let Some(config) = stack.config_v4() {
@@ -373,7 +413,7 @@ async fn tcp_server(stack: Stack<'static>) {
         info!("Desktop connected: {:?}", socket.remote_endpoint());
         let (mut reader, mut writer) = socket.split();
         // Whichever side fails first ends the session.
-        select(read_commands(&mut reader), send_telemetry(&mut writer)).await;
+        select(read_commands(&mut reader), send_updates(&mut writer)).await;
         // Stopping is the fail-safe: drop the keys even if the link died.
         clear_keys();
         socket.abort();
@@ -424,9 +464,29 @@ async fn read_commands(reader: &mut TcpReader<'_>) {
     }
 }
 
-async fn send_telemetry(writer: &mut TcpWriter<'_>) {
+async fn write_all(writer: &mut TcpWriter<'_>, mut bytes: &[u8]) -> Result<(), ()> {
+    while !bytes.is_empty() {
+        let written = writer
+            .write_with(|buf| {
+                let n = buf.len().min(bytes.len());
+                buf[..n].copy_from_slice(&bytes[..n]);
+                (n, n)
+            })
+            .await;
+        match written {
+            Ok(0) | Err(_) => return Err(()),
+            Ok(n) => bytes = &bytes[n..],
+        }
+    }
+    Ok(())
+}
+
+/// Telemetry every tick, plus the newest camera frame whenever there is one
+/// the desktop has not had yet.
+async fn send_updates(writer: &mut TcpWriter<'_>) {
     let mut ticker = Ticker::every(TELEMETRY_PERIOD);
     let mut frame = [0u8; 512];
+    let mut sent_frame = None;
     loop {
         let len = with_shared(|s| {
             wire::encode_telemetry(
@@ -445,20 +505,24 @@ async fn send_telemetry(writer: &mut TcpWriter<'_>) {
             )
         });
         let Some(len) = len else { return };
-        let mut sent = 0;
-        while sent < len {
-            let chunk = &frame[sent..len];
-            let written = writer
-                .write_with(|buf| {
-                    let n = buf.len().min(chunk.len());
-                    buf[..n].copy_from_slice(&chunk[..n]);
-                    (n, n)
-                })
-                .await;
-            match written {
-                Ok(0) | Err(_) => return,
-                Ok(n) => sent += n,
+        if write_all(writer, &frame[..len]).await.is_err() {
+            return;
+        }
+        // Holding the lock while sending makes the camera skip frames
+        // instead of overwriting the one in flight.
+        if let Ok(video) = camera::LATEST.try_lock()
+            && video.len > 0
+            && sent_frame != Some(video.seq)
+        {
+            let jpeg = &video.data[..video.len];
+            if write_all(writer, &wire::header(wire::VIDEO, jpeg.len()))
+                .await
+                .is_err()
+                || write_all(writer, jpeg).await.is_err()
+            {
+                return;
             }
+            sent_frame = Some(video.seq);
         }
         ticker.next().await;
     }
