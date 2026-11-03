@@ -72,10 +72,41 @@ Sphero's [Pi setup guide](https://sdk.sphero.com/raspberry-pi-setup/python-sdk-s
 
 - `pi/agent.py`: camera, RVR SDK, sensor subscriptions, motor control, watchdog, and TCP server.
 - `pi/embody-pi.service`: boot service definition installed at `/etc/systemd/system/embody-pi.service` on the Pi.
-- `desktop/src/`: Rust video window, in-place dashboard, terminal controls, JSON mode, protocol, and SSH tunnel.
+- `desktop/src/`: Rust video window, in-place dashboard, terminal controls, JSON mode, protocol, and SSH tunnel. `nav.rs` holds the pose skills.
+- `brain/embody_brain.py`: Claude tool loop for typed tasks. `tools/sim_rover.py`: simulated rover for testing without hardware.
 
-For AI or other programs, run `cargo run --release -- --json`. It reads newline-delimited JSON on stdin and writes JSON events on stdout. Send `{"keys":"wa","duration_ms":500}` for a bounded drive command (maximum 2000 ms), `{"stop":true}`, `{"snapshot":"/absolute/path/frame.jpg"}`, or `{"quit":true}`. Telemetry arrives as `{"type":"telemetry","data":...}`. The JSON mode has no terminal dashboard or video window; snapshot requests save the latest full-rate camera frame.
+For AI or other programs, run `cargo run --release -- --json`. It reads newline-delimited JSON on stdin and writes JSON events on stdout. Send `{"keys":"wa","duration_ms":500}` for a bounded drive command (maximum 2000 ms), `{"vel":[0.2,-30],"duration_ms":500}` for a bounded velocity (m/s, degrees/s), `{"stop":true}`, `{"snapshot":"/absolute/path/frame.jpg"}`, or `{"quit":true}`. Telemetry arrives at most five times a second as `{"type":"telemetry","data":...}`. The JSON mode has no terminal dashboard or video window; snapshot requests save the latest full-rate camera frame. Any request may carry an `"id"`, which its reply echoes.
 
-Packets have a 1-byte type, 4-byte big-endian payload length, then payload. Desktop sends `C` with JSON such as `{"keys":"wa"}` every 100 ms. Pi sends `V` with a complete JPEG frame and `T` with JSON telemetry about four times a second. One desktop client controls the rover at a time. The protocol is simple enough for a later LLM program to use while sampling frames for YOLO at a lower rate than the 30 fps display.
+### Pose and skills
+
+Both rover agents stream the RVR's own wheel and IMU odometry as `pose` (`x`, `y` in metres, `yaw` in degrees). `+y` is the heading at the last pose reset, `+x` is to its right, and yaw is counter-clockwise positive. Reset it with `R` in the dashboard or `{"reset_pose":true}`: the current spot and heading become `(0, 0, 0°)`. The RVR also restarts the frame when it powers up.
+
+In JSON mode, a skill runs a closed loop on that pose at 20 Hz and reports once when it ends:
+
+```json
+{"skill":"drive","distance_m":3.0,"speed_mps":0.3,"id":1}
+{"skill":"turn","degrees":-90}
+{"skill":"turn_to","yaw_deg":0}
+{"skill":"go_to","x":1.2,"y":3.0,"yaw_deg":90}
+{"skill":"go_to","place":"desk"}
+```
+
+Each produces `{"type":"skill","state":"started",...}`, then one of `done`, `failed` (with a reason) or `cancelled` (another command replaced it). Speeds are capped at 0.6 m/s. A skill fails if the remaining distance or angle stops shrinking for 2.5 s (blocked or slipping), if the pose is older than 400 ms, or on a time limit. There is no obstacle sensing: test skills on raised tracks or in a clear area. `{"remember":"desk"}`, `{"forget":"desk"}` and `{"places":true}` manage named poses; with `--places FILE` they are kept between runs. Places stay valid only if the rover is reset at the same marked spot and heading each session. `{"status":true}` reports the pose and running skill.
+
+Without hardware, `python3 tools/sim_rover.py` serves a simulated rover on `127.0.0.1:8765` for `--direct 127.0.0.1:8765`.
+
+### Language tasks
+
+`brain/embody_brain.py` gives Claude these skills as tools and runs the JSON mode for it. Claude is called once per step of a task, and each step is a whole move:
+
+```sh
+python3 -m venv .venv && .venv/bin/pip install -r brain/requirements.txt
+(cd desktop && cargo build --release --locked)
+.venv/bin/python brain/embody_brain.py --direct <esp-ip>   # or --target pi5
+```
+
+It needs Claude API credentials (`ANTHROPIC_API_KEY`, or a profile from `ant auth login`). Type a task such as "drive to the door, then come back home". `/stop`, `/reset`, `/status` and `/quit` act immediately, and Ctrl-C stops a moving rover. Places are saved in `places.json` at the repository root (ignored by git).
+
+Packets have a 1-byte type, 4-byte big-endian payload length, then payload. Desktop sends `C` with JSON such as `{"keys":"wa"}`, `{"vel":[0.3,0]}` or `{"reset_pose":true}` at least every 50 ms while driving. Pi sends `V` with a complete JPEG frame and `T` with JSON telemetry about four times a second. One desktop client controls the rover at a time. The protocol is simple enough for a later LLM program to use while sampling frames for YOLO at a lower rate than the 30 fps display.
 
 See [PLAN.md](PLAN.md) for the remaining robot and LLM work.

@@ -2,3 +2,4 @@ desktop/target/
 __pycache__/
 *.pyc
 .venv/
+places.json
